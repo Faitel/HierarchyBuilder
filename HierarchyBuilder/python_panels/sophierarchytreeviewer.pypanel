@@ -1,0 +1,712 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <!-- This file contains definitions of Python interfaces and the
+ interfaces menu.  It should not be hand-edited when it is being
+ used by the application.  Note, that two definitions of the
+ same interface or of the interfaces menu are not allowed
+ in a single file. -->
+  <interface name="sop_hierarchy_tree_viewer" label="Hierarchy Tree Viewer" icon="hicon:/SVGIcons.index?BUTTONS_tree_full.svg" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[import hou
+import PySide2.QtWidgets as QtWidgets
+from PySide2 import QtCore, QtGui
+
+class HierarchyBuilder():
+    def __init__(self):
+        self.hb_remember_selected_action = True
+        self.hb_tree_widget = None
+        self.hb_rename_node_enabled = False
+        self.hb_current_selected_node = None
+        self.scrollbar_value = 0
+        super(HierarchyBuilder, self).__init__()
+    
+    class CustomDelegate(QtWidgets.QStyledItemDelegate):
+        def __init__(self, parent=None):
+            super(HierarchyBuilder.CustomDelegate, self).__init__(parent)
+
+        def createEditor(self, parent, option, index):
+            if index.column() in (0, 5, 6):
+                return super(HierarchyBuilder.CustomDelegate, self).createEditor(parent, option, index)
+            elif index.column() in (1, 2):
+                checkbox = QtWidgets.QCheckBox(parent)
+                checkbox.setFixedSize(30, 30)  # Set the size of the checkbox to fit the column width
+                checkbox.setAutoFillBackground(True)
+                checkbox.setStyleSheet("QCheckBox::indicator { width: 16px; height: 16px; }")  # Set the size of the indicator
+                return checkbox
+            else:
+                return None
+
+        def updateEditorGeometry(self, editor, option, index):
+            if index.column() in (1, 2):
+                checkbox_width = 16
+                checkbox_height = 16
+                padding_x = ((option.rect.width() - checkbox_width) / 2)
+                padding_y = ((option.rect.height() - checkbox_height) / 2)
+                editor.setGeometry(option.rect.x() + padding_x, option.rect.y() + padding_y, checkbox_width, checkbox_height)
+            else:
+                super(HierarchyBuilder.CustomDelegate, self).updateEditorGeometry(editor, option, index)
+
+
+        def paint(self, painter, option, index):
+            if index.column() in (1, 2, 3, 4):
+                # Handle center alignment for the content of specified columns
+                option.displayAlignment = QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter
+
+            # Draw drop indicator in the Linked Node column
+            if index.column() == 5 and option.state & QtWidgets.QStyle.State_MouseOver:
+                rect = option.rect
+                painter.setPen(QtGui.QColor(0, 120, 215))
+                painter.drawRect(rect)
+
+            super(HierarchyBuilder.CustomDelegate, self).paint(painter, option, index)
+
+    class CustomLinkedNodeDelegate(QtWidgets.QStyledItemDelegate):
+        def initStyleOption(self, option, index):
+            super(HierarchyBuilder.CustomLinkedNodeDelegate, self).initStyleOption(option, index)
+            option.state &= ~QtWidgets.QStyle.State_MouseOver
+            
+    class CustomTreeWidget(QtWidgets.QTreeWidget):
+        def __init__(self, parent=None):
+            super(HierarchyBuilder.CustomTreeWidget, self).__init__(parent)
+            self.setAcceptDrops(True)  # Allow the tree widget to accept drops
+            self.scrollbar_value = 0
+            
+        def dragEnterEvent(self, event):
+            if event.mimeData().hasFormat('text/plain'):
+                event.acceptProposedAction()
+
+ 
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self.verticalScrollBar().setValue(self.scrollbar_value)
+            
+        def dragMoveEvent(self, event):
+            item = self.itemAt(event.pos())
+            if item:
+                column = self.indexAt(event.pos()).column()
+                if column == 5:
+                    event.setDropAction(QtCore.Qt.CopyAction)
+                    event.accept()
+                    return
+            event.ignore()
+
+        def dropEvent(self, event):
+            item = self.itemAt(event.pos())
+            if item:
+                column = self.indexAt(event.pos()).column()
+                if column == 5:
+                    mime_data = event.mimeData()
+                    if mime_data.hasText():
+                        dropped_text = mime_data.text()
+                        dropped_node = hou.node(dropped_text)
+                        if dropped_node:
+                            target_node_path = item.data(0, QtCore.Qt.UserRole)
+                            target_node = hou.node(target_node_path)
+                            if target_node and target_node.parm("geometry") and target_node.parm("import_geo"):
+                                # Set the relative path to the dropped node in the "geometry" parameter
+                                target_node.parm("geometry").set(target_node.relativePathTo(dropped_node))
+                                # Set "import_geo" parameter to 1
+                                target_node.parm("import_geo").set(1)
+                                # Refresh the tree view
+                                hou.session.hb_HierarchyBuilder.update_label()
+                    
+                       
+                                event.accept()
+                                return
+            event.ignore()
+                
+        def mouseDoubleClickEvent(self, event):
+            item = self.itemAt(event.pos())
+            if item is not None:
+                column = self.currentColumn()
+                if column in [1, 2]:
+                    rect = self.visualItemRect(item)
+                    checkbox_rect = QtCore.QRect(rect.left() + 10, rect.top() + 6, 20, 20)
+                    if not checkbox_rect.contains(event.pos()):
+                        event.ignore()
+                        return
+            super(HierarchyBuilder.CustomTreeWidget, self).mouseDoubleClickEvent(event)
+
+    class CustomTreeWidgetItem(QtWidgets.QTreeWidgetItem):
+        def __init__(self, name, is_template, is_empty, has_xforms, pack_input, linked_node, node_path):
+            super(HierarchyBuilder.CustomTreeWidgetItem, self).__init__()
+            self.setText(0, name)
+            self.setData(0, QtCore.Qt.UserRole, node_path)
+            self.setFlags(self.flags() | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEditable)
+            
+            self.setData(1, QtCore.Qt.CheckStateRole, QtCore.Qt.Checked if is_template else QtCore.Qt.Unchecked)
+            self.setData(2, QtCore.Qt.CheckStateRole, QtCore.Qt.Checked if is_empty else QtCore.Qt.Unchecked)
+            
+            self.setText(3, "Yes" if has_xforms == 1 else "No")
+            self.setText(4, "Yes" if pack_input == 1 else "No")
+
+            self.setText(5, linked_node.split("/")[-1])  # Set the "Linked Node" column data with only the last item of the absolute path
+            self.setData(5, QtCore.Qt.UserRole, linked_node)  # Store the full absolute path as UserRole data for the "Linked Node" column
+
+        def data(self, column, role):
+            if role == QtCore.Qt.ToolTipRole:
+                if column == 0:
+                    node_path = self.data(0, QtCore.Qt.UserRole)
+                    column_name = self.treeWidget().headerItem().text(column)
+                    tooltip = "<b>Node:</b><br>{1}".format(column_name, node_path)
+                    return tooltip
+                elif column == 5:
+                    linked_node_abspath = self.data(5, QtCore.Qt.UserRole)
+                    if linked_node_abspath == "Not used":
+                        return "Linked Node <b>checkbox is not set</b> on Hierarchy builder node"
+                    elif linked_node_abspath == "":
+                        return "Linked Node <b>checkbox is checked</b> but path is not set"
+                    else:
+                        return f"<b>Linked Node:</b><br>{linked_node_abspath}"
+                else:
+                    return None  # no tooltip for other columns
+            else:
+                return super(HierarchyBuilder.CustomTreeWidgetItem, self).data(column, role)
+
+    class CustomHeader(QtWidgets.QHeaderView):
+        def __init__(self, orientation, parent=None):
+            super(HierarchyBuilder.CustomHeader, self).__init__(orientation, parent)
+
+        def create_action_triggered_handler(self, column):
+            def handler(checked):
+                self.setSectionHidden(column, not checked)
+
+            return handler
+
+    
+    def get_unique_prim_names(self, node):
+        if node is None:
+            return set()
+    
+        try:
+            geometry_parm = node.parm("geometry")
+        except hou.ObjectWasDeleted:
+            return set()
+
+
+        geometry = node.geometry()
+    
+        if geometry is None:
+            return set("")
+        
+        prim_attr = geometry.primAttribs()
+        unique_names = set()
+        if "name" in [a.name() for a in prim_attr]:
+            for prim in geometry.prims():
+                prim_name = prim.attribValue("name")
+                unique_names.add(prim_name)
+        return unique_names
+
+
+
+        
+    def create_hierarchy_from_names(self, unique_names):
+        hierarchy = {}
+        for name in unique_names:
+            parts = name.split('/')
+            current_level = hierarchy
+            for part in parts:
+                if part not in current_level:
+                    current_level[part] = {}
+                current_level = current_level[part]
+        return hierarchy
+        
+    def tree_hierarchy(self, item=None):
+        if not item:
+            item = self.hb_tree_widget.invisibleRootItem()
+    
+        hierarchy = {}
+        for i in range(item.childCount()):
+            child_item = item.child(i)
+            child_key = child_item.text(0)
+            hierarchy[child_key] = self.tree_hierarchy(child_item)
+    
+        return hierarchy
+        
+    def add_missing_items(self, hierarchy, item=None):
+        if not item:
+            item = self.hb_tree_widget.invisibleRootItem()
+    
+        existing_hierarchy = self.tree_hierarchy(item)
+        for key, value in hierarchy.items():
+            if key not in existing_hierarchy:
+                new_item = QtWidgets.QTreeWidgetItem([key])
+                new_item.setFlags(new_item.flags() & ~QtCore.Qt.ItemIsEnabled)
+                item.addChild(new_item)
+                self.hb_tree_widget.expandItem(item)
+            else:
+                index = list(existing_hierarchy.keys()).index(key)
+                existing_item = item.child(index)
+    
+            self.add_missing_items(value, existing_item)
+            
+    def merge_hierarchies(self, existing_hierarchy, new_hierarchy, item=None):
+        if not item:
+            item = self.hb_tree_widget.invisibleRootItem()
+    
+        for key, value in new_hierarchy.items():
+            if key not in existing_hierarchy:
+                child_item = QtWidgets.QTreeWidgetItem([key])
+                item.addChild(child_item)
+                existing_hierarchy[key] = {}
+            else:
+                # Find the child item with the key in the existing hierarchy
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    if child.text(0) == key:
+                        child_item = child
+                        break
+    
+            self.merge_hierarchies(existing_hierarchy[key], value, child_item)
+            
+    def store_expanded_items(self, item=None, current_path=None, expanded_paths=None):
+        if expanded_paths is None:
+            expanded_paths = []
+        if current_path is None:
+            current_path = []
+        if item is None:
+            item = self.hb_tree_widget.invisibleRootItem()
+    
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_path = current_path + [child.text(0)]
+            if child.isExpanded():
+                expanded_paths.append('/'.join(child_path))
+                self.store_expanded_items(child, child_path, expanded_paths)
+    
+        return expanded_paths
+        
+    def expand_stored_items(self, expanded_paths, item=None, current_path=None):
+        if current_path is None:
+            current_path = []
+        if item is None:
+            item = self.hb_tree_widget.invisibleRootItem()
+    
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_path = current_path + [child.text(0)]
+            child_path_str = '/'.join(child_path)
+            if child_path_str in expanded_paths:
+                child.setExpanded(True)
+                self.expand_stored_items(expanded_paths, child, child_path)
+    
+    def restore_scrollbar_position(self, parent, start, end):
+        self.hb_tree_widget.verticalScrollBar().setValue(self.scrollbar_value)
+        self.hb_tree_widget.model().rowsInserted.disconnect(self.restore_scrollbar_position)
+
+    def update_label(self):
+        node = None
+        if self.hb_remember_selected_action.isChecked() and self.hb_current_selected_node:
+            node = self.hb_current_selected_node
+        else:
+            node = self.get_selected_node_info()
+        if not node:
+            return
+        hou.session.hb_selected_node = node
+        expanded_paths = self.store_expanded_items()
+        self.hb_tree_widget.scrollbar_value = self.hb_tree_widget.verticalScrollBar().value()
+        self.hb_tree_widget.clear()
+        # Get the list of unique primitive "name" attributes
+        unique_names = self.get_unique_prim_names(node)
+        
+        if node:
+            tree = self.get_hierarchy_tree(node)
+
+            self.hb_tree_widget.clear()
+            tree_item = self.create_tree_item(tree)
+            self.hb_tree_widget.addTopLevelItem(tree_item)
+            self.hb_tree_widget.expandAll()
+            
+            # Create a hierarchy from the unique primitive "name" attributes
+            hierarchy = self.create_hierarchy_from_names(unique_names)
+        
+            # Extract the existing hierarchy from the tree widget
+            existing_hierarchy = self.tree_hierarchy()
+        
+            # Merge the new hierarchy into the existing hierarchy
+            self.merge_hierarchies(existing_hierarchy, hierarchy)
+            self.expand_stored_items(expanded_paths)
+            
+            if self.hb_remember_selected_action.isChecked():
+                self.hb_current_selected_node = node
+        else:
+            self.hb_tree_widget.clear()
+        
+        
+
+    def select_node_from_tree_item(self, item, _column):
+        self.hb_current_selected_node
+        if _column == 5:  # Linked Node column
+            node_path = item.data(5, QtCore.Qt.UserRole)
+        else:
+            node_path = item.data(0, QtCore.Qt.UserRole)
+
+        if node_path:
+            node = hou.node(node_path)
+            if node:
+                if not self.hb_remember_selected_action.isChecked():
+                    self.hb_current_selected_node = node
+                network_editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
+                if network_editor:
+                    network_editor.setCurrentNode(node)
+                    network_editor.homeToSelection()
+                    
+    def is_hierarchy_builder_node(self, node):
+        if node is None:
+            return False
+        node_type_name = node.type().name()
+        return "FaitelTech::hierarchy_builder" in node_type_name
+        
+    def get_hierarchy_tree(self, node):
+        if node is None:
+            return None
+        tree = {}
+        
+        if self.is_hierarchy_builder_node(node):
+            tree['name'] = node.name()
+            tree['path'] = node.path()
+            tree['inputs'] = []
+
+            for input_node in node.inputs():
+                input_tree = self.get_hierarchy_tree(input_node)
+                if input_tree:
+                    tree['inputs'].append(input_tree)
+
+        else:
+            for input_node in node.inputs():
+                input_tree = self.get_hierarchy_tree(input_node)
+                if input_tree:
+                    tree = input_tree
+                    break
+
+        return tree
+
+    def create_tree_item(self, tree_data):
+    
+        try:
+            node = hou.node(tree_data['path'])
+        except hou.ObjectWasDeleted:
+            return None
+    
+        if node is None:
+            return None
+    
+        containername = node.parm("containername").eval() if node.parm("containername") else None
+        name = containername if containername else tree_data['name']
+    
+        # Get the Template, Empty and Pack Input values
+        is_template = node.isTemplateFlagSet()
+        is_empty = node.parm('empty').eval() if node.parm('empty') else False
+        pack_input = node.parm('packinput').eval() if node.parm('packinput') else 0
+    
+        # Get the has_xforms attribute value
+        geometry = node.geometry()
+        if geometry is not None:
+            has_xforms = geometry.attribValue("has_xforms") if geometry.findGlobalAttrib("has_xforms") else 0
+        else:
+            has_xforms = 0
+    
+        import_geo = node.parm("import_geo").eval() if node.parm("import_geo") else 0
+        if import_geo:
+            object_merge_node = node.node("object_merge")
+            path_parm = object_merge_node.parm("objpath1") if object_merge_node else None
+            linked_node_abspath = path_parm.eval() if path_parm else "Not found"
+        else:
+            linked_node_abspath = "Not used"
+    
+        linked_node_name = linked_node_abspath.split("/")[-1] if linked_node_abspath not in ["Not used", "Not found", ""] else linked_node_abspath
+        
+        item = self.CustomTreeWidgetItem(name, is_template, is_empty, has_xforms, pack_input, linked_node_name, tree_data['path'])
+        item.setData(5, QtCore.Qt.UserRole, linked_node_abspath)  # Store the full absolute path in UserRole for the tooltip
+    
+        for input_data in tree_data.get('inputs', []):
+            input_item = self.create_tree_item(input_data)
+            if input_item is not None:
+                item.addChild(input_item)
+        return item
+
+
+
+
+    def stretch_last_visible_column(self):
+        header = self.hb_tree_widget.header()
+        visible_columns = [i for i in range(header.count()) if not header.isSectionHidden(i)]
+        if visible_columns:
+            last_visible_column = visible_columns[-1]
+            for i in range(header.count()):
+                if i == last_visible_column:
+                    header.setSectionResizeMode(i, QtWidgets.QHeaderView.Stretch)
+                else:
+                    header.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
+
+    def get_selected_node_info(self):
+        if not hou.isUIAvailable():
+            return None
+
+        desktop = hou.ui.curDesktop()
+        network_editor = desktop.paneTabOfType(hou.paneTabType.NetworkEditor)
+        current_node = network_editor.pwd()
+        selected_nodes = current_node.selectedChildren()
+        
+        if selected_nodes:
+            node = selected_nodes[0]
+            if self.is_hierarchy_builder_node(node):
+                
+                return node
+            else:
+                hou.ui.setStatusMessage("No Hierarchy Builder node is selected.", hou.severityType.Message)
+                return None
+        else:
+            hou.ui.setStatusMessage("No node is currently selected.", hou.severityType.Message)
+            return None
+
+    def get_detail_attributes(self,node):
+        geometry = node.geometry()
+        has_xforms = geometry.attribValue("has_xforms") if geometry.findGlobalAttrib("has_xforms") else None
+        containername = node.parm("containername").eval() if node.parm("containername") else None
+        return has_xforms, containername
+
+
+    def set_empty_parameter(self, empty_checkbox):
+        node = self.get_selected_node_info()
+        if node:
+            node.parm('empty').set(empty_checkbox.isChecked())
+            hou.session.hb_HierarchyBuilder.load()
+            
+
+    def update_hb_current_selected_node(self,state):
+        self.hb_current_selected_node
+
+        if state == QtCore.Qt.Checked:
+            selected_node = self.get_selected_node_info()
+            if selected_node is not None:
+                self.hb_current_selected_node = selected_node
+        else:
+            self.hb_current_selected_node = None
+
+    def select_linked_node(self,item):
+        node_path = item.data(0, QtCore.Qt.UserRole)
+        linked_node_path = item.data(5, QtCore.Qt.UserRole)  
+        if node_path and linked_node_path not in ["Not found", "Not used"]:
+            linked_node = hou.node(linked_node_path)
+            if linked_node:
+                network_editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
+                if network_editor:
+                    network_editor.setCurrentNode(linked_node)
+                    network_editor.homeToSelection()
+                    #linked_node.setDisplayFlag(True)
+
+    def set_template_flag(self,template_checkbox):
+        node = self.get_selected_node_info()
+        if node:
+            node.setTemplateFlag(template_checkbox.isChecked())
+
+    def update_node_from_item(self, item, column):
+        self.hb_rename_node_enabled
+        if column in (0, 1, 2):
+            node_path = item.data(0, QtCore.Qt.UserRole)
+            node = hou.node(node_path)
+            if node:
+                if column == 0 and self.hb_rename_node_enabled:
+                    new_name = item.text(0)
+                    node.setName(new_name, unique_name=True)
+                elif column == 1:
+                    node.setTemplateFlag(item.checkState(1) == QtCore.Qt.Checked)
+                elif column == 2 and node.parm('empty'):
+                    node.parm('empty').set(item.checkState(2) == QtCore.Qt.Checked)
+
+    def update_containername_from_item(self, item, column):
+        self.hb_rename_node_enabled
+        if column == 0:
+            new_name = item.text(column)
+            if new_name != "":
+                node_path = item.data(0, QtCore.Qt.UserRole)
+                node = hou.node(node_path)
+                if node:
+                    if node.parm('containername'):
+                        node.parm('containername').set(new_name)
+                    if self.hb_rename_node_enabled:
+                        node.setName(new_name, unique_name=True)
+                        new_node_path = node.path()
+                        item.setData(0, QtCore.Qt.UserRole, new_node_path)
+            else:
+                node_path = item.data(0, QtCore.Qt.UserRole)
+                node = hou.node(node_path)
+                if node and node.parm('containername'):
+                    old_name = node.parm('containername').eval()
+                    item.setText(column, old_name)
+
+    def display_status_bar_message(self):
+        node = None
+        if self.hb_remember_selected_action.isChecked() and self.hb_current_selected_node:
+            node = self.hb_current_selected_node
+        else:
+            node = self.get_selected_node_info()
+
+        if not node:
+            hou.ui.setStatusMessage("No Hierarchy Builder node is selected", hou.severityType.Warning)
+        else:
+            hou.ui.setStatusMessage("")
+
+    def clear_tree_and_forget_node(self):
+        self.hb_current_selected_node
+        self.hb_current_selected_node = None
+        self.hb_tree_widget.clear()
+        
+    def displayhelp(self):
+        desktop = hou.ui.curDesktop()
+        desktop.displayHelpPath("/nodes/sop/FaitelTech--hierarchy_builder-1.0#hierarchy-tree-viewer")
+               
+    def load(self):
+        # Create a root widget
+        root = QtWidgets.QWidget()
+
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        
+        self.hb_tree_widget = self.CustomTreeWidget()
+        self.hb_tree_widget.setColumnCount(6)
+
+        # Create hou.qt.Icon objects for the tree widget columns
+        tree_icons = [
+            hou.qt.Icon("BUTTONS_tree", width=64, height=64),
+            hou.qt.Icon("NETVIEW_selectable_template_flag", width=64, height=64),
+            hou.qt.Icon("NODEFLAGS_origin", width=64, height=64),
+            hou.qt.Icon("BUTTONS_translate", width=64, height=64),
+            hou.qt.Icon("SOP_pack", width=64, height=64),
+            hou.qt.Icon("NODEFLAGS_export", width=64, height=64)
+        ]
+
+        # Define the column tooltips (the original column labels)
+        tooltips = ["Node", "Template", "Empty", "Has Transforms", "Pack Input", "Linked Node"]
+
+        header_item = QtWidgets.QTreeWidgetItem([""] * 6)
+        for i in range(6):
+            header_item.setIcon(i, tree_icons[i])
+            header_item.setToolTip(i, tooltips[i])
+        self.hb_tree_widget.setHeaderItem(header_item)
+
+        self.hb_tree_widget.setItemDelegate(self.CustomDelegate())
+        self.hb_tree_widget.setItemDelegateForColumn(5, self.CustomLinkedNodeDelegate())
+
+        self.hb_tree_widget.itemChanged.connect(lambda item, column: (self.update_node_from_item(item, column), self.update_containername_from_item(item, column))[0])
+
+        self.hb_tree_widget.setHeader(self.CustomHeader(QtCore.Qt.Horizontal, self.hb_tree_widget))
+
+        # Set column widths and alignment
+        header = self.hb_tree_widget.header()
+        header.setDefaultAlignment(QtCore.Qt.AlignCenter)  # Set default column header alignment to center
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)  # Set the Template column to a fixed width
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)  # Set the Empty column to a fixed width
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Fixed)  # Set the Has Transforms column to a fixed width
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.Fixed)  # Set the Packed Input column to a fixed width
+        header.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)  # Set the Linked Node column to a fixed width
+        header.resizeSection(0, 180) # Set the width of the Node column to pixels
+        header.resizeSection(1, 30)  # Set the width of the Template column to pixels
+        header.resizeSection(2, 30)  # Set the width of the Empty column to pixels
+        header.resizeSection(3, 30)  # Set the width of the Has Transforms column to pixels
+        header.resizeSection(4, 30)  # Set the width of the Packed Input column to pixels
+
+        # Add the tree widget to the main layout
+        layout.addWidget(self.hb_tree_widget)
+        # Create a menu bar
+        menu_bar = hou.qt.MenuBar()
+        # Create a button with the desired icon
+        
+        # Add menus to the menu bar
+        panel_menu = menu_bar.addMenu("Panel")
+        
+        reload_action = panel_menu.addAction("Reload")
+        reload_action_icon = hou.qt.Icon("BUTTONS_reload")
+        reload_action.setIcon(reload_action_icon)
+        reload_action.triggered.connect(lambda: (self.update_label(), self.display_status_bar_message())[-1])
+        
+        clear_action = panel_menu.addAction("Clear")
+        clear_action_icon = hou.qt.Icon("BUTTONS_delete_mini")
+        clear_action.setIcon(clear_action_icon)
+        clear_action.triggered.connect(lambda: self.clear_tree_and_forget_node())
+        
+        panel_menu.addSeparator()
+        
+        self.template_column_action = QtWidgets.QAction("Template", panel_menu)
+        self.template_column_action.setCheckable(True)
+        self.template_column_action.setChecked(True)
+        self.template_column_action.triggered.connect(lambda checked: self.hb_tree_widget.setColumnHidden(1, not checked))
+
+        panel_menu.addAction(self.template_column_action)
+        self.empty_column_action = QtWidgets.QAction("Empty", panel_menu)
+        self.empty_column_action.setCheckable(True)
+        self.empty_column_action.setChecked(True)
+        self.empty_column_action.triggered.connect(lambda checked: self.hb_tree_widget.setColumnHidden(2, not checked))
+
+        panel_menu.addAction(self.empty_column_action)    
+        self.has_xforms_column_action = QtWidgets.QAction("Has Transforms", panel_menu)
+        self.has_xforms_column_action.setCheckable(True)
+        self.has_xforms_column_action.setChecked(True)
+        self.has_xforms_column_action.triggered.connect(lambda checked: self.hb_tree_widget.setColumnHidden(3, not checked))
+
+        panel_menu.addAction(self.has_xforms_column_action) 
+        self.pack_input_column_action = QtWidgets.QAction("Pack Input", panel_menu)
+        self.pack_input_column_action.setCheckable(True)
+        self.pack_input_column_action.setChecked(True)
+        self.pack_input_column_action.triggered.connect(lambda checked: self.hb_tree_widget.setColumnHidden(4, not checked))
+
+        panel_menu.addAction(self.pack_input_column_action)     
+        self.linked_node_column_action = QtWidgets.QAction("Linked Node", panel_menu)
+        self.linked_node_column_action.setCheckable(True)
+        self.linked_node_column_action.setChecked(True)
+        self.linked_node_column_action.triggered.connect(lambda checked: self.hb_tree_widget.setColumnHidden(5, not checked))
+
+        panel_menu.addAction(self.linked_node_column_action)   
+        
+        options_menu = menu_bar.addMenu("Options")
+        
+        self.hb_remember_selected_action = QtWidgets.QAction("Remember Hierarchy Builder", options_menu)
+        self.hb_remember_selected_action.setCheckable(True)
+        self.hb_remember_selected_action.setChecked(True)
+        self.hb_remember_selected_action.triggered.connect(lambda checked: self.update_hb_current_selected_node(checked))
+        options_menu.addAction(self.hb_remember_selected_action)   
+        
+        
+        help_menu = menu_bar.addAction("Help")
+        help_menu.triggered.connect(lambda: self.displayhelp())
+        
+        
+        reload_on_panel = menu_bar.addAction("Reload")
+        reload_on_panel.triggered.connect(lambda: (self.update_label(), self.display_status_bar_message())[-1])
+        icon = hou.qt.Icon("BUTTONS_reload")
+        reload_on_panel.setIcon(icon)
+        
+        clear_on_panel = menu_bar.addAction("Clear")
+        clear_on_panel.triggered.connect(lambda: self.clear_tree_and_forget_node())
+        icon = hou.qt.Icon("BUTTONS_delete_mini")
+        clear_on_panel.setIcon(icon)
+        
+        style_sheet = '''
+        QMenuBar {
+        margin-top: 0px;
+        margin-bottom: 0px;
+        }
+        '''
+        
+        menu_bar.setStyleSheet(style_sheet)
+        layout.setMenuBar(menu_bar)
+        
+        # Set spacing and margins for the main layout
+        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.hb_tree_widget.itemClicked.connect(lambda item, column: self.select_node_from_tree_item(item, column) if column == 0 else None)
+        self.hb_tree_widget.itemClicked.connect(lambda item, column: self.select_linked_node(item) if column == 5 and item.text(column) not in ["Not found", "Not used"] else None)
+
+        self.update_label()
+
+        return widget
+
+def onCreateInterface():
+    hou.session.hb_HierarchyBuilder = HierarchyBuilder()
+    widget = hou.session.hb_HierarchyBuilder.load()
+    return widget]]></script>
+    <includeInPaneTabMenu menu_position="0" create_separator="false"/>
+    <help><![CDATA[]]></help>
+  </interface>
+</pythonPanelDocument>

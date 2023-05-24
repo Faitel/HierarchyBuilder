@@ -1,0 +1,1 @@
+COPY packages, HierarchyBuilder folder to Houdini preference folder (Documents\houdini19.5)

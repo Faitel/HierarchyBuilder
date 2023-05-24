@@ -1,0 +1,12 @@
+{
+    "enable" : true,
+    "path": "$HOUDINI_USER_PREF_DIR/HierarchyBuilder",
+    "env": [
+            
+            {
+                "var":   "HIERARCHYBUILDER_PATH",
+                "value": "$HOUDINI_USER_PREF_DIR/HierarchyBuilder"
+            },
+
+           ]
+}
